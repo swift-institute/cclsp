@@ -125,6 +125,74 @@ export function flattenDocumentSymbols(symbols: DocumentSymbol[]): DocumentSymbo
   return flattened;
 }
 
+/**
+ * Find a symbol by qualified name (e.g., "Memory.Address") by walking the
+ * document symbol hierarchy. Returns matching leaf symbols.
+ */
+export function findSymbolByQualifiedName(
+  symbols: DocumentSymbol[],
+  components: string[]
+): DocumentSymbol[] {
+  if (components.length === 0) return [];
+
+  const [head, ...rest] = components;
+  const matches: DocumentSymbol[] = [];
+
+  for (const symbol of symbols) {
+    if (symbol.name === head) {
+      if (rest.length === 0) {
+        matches.push(symbol);
+      } else if (symbol.children) {
+        matches.push(...findSymbolByQualifiedName(symbol.children, rest));
+      }
+    }
+  }
+
+  return matches;
+}
+
+/**
+ * Symbol kind priority for ranking matches. Lower is better.
+ * Concrete type declarations rank higher than type parameters.
+ */
+const SYMBOL_KIND_PRIORITY: Record<number, number> = {
+  [SymbolKind.Class]: 0,
+  [SymbolKind.Struct]: 0,
+  [SymbolKind.Enum]: 0,
+  [SymbolKind.Interface]: 0,
+  [SymbolKind.Function]: 1,
+  [SymbolKind.Method]: 1,
+  [SymbolKind.Constructor]: 1,
+  [SymbolKind.Property]: 2,
+  [SymbolKind.Field]: 2,
+  [SymbolKind.Variable]: 2,
+  [SymbolKind.Constant]: 2,
+  [SymbolKind.EnumMember]: 2,
+  [SymbolKind.Namespace]: 3,
+  [SymbolKind.Module]: 3,
+  [SymbolKind.Package]: 3,
+  [SymbolKind.TypeParameter]: 4,
+};
+
+function getSymbolPriority(kind: SymbolKind): number {
+  return SYMBOL_KIND_PRIORITY[kind] ?? 3;
+}
+
+/**
+ * Sort symbol matches: exact name matches first, then by kind priority.
+ */
+function rankSymbolMatches(matches: SymbolMatch[], symbolName: string): SymbolMatch[] {
+  return [...matches].sort((a, b) => {
+    // Exact name match beats substring match
+    const aExact = a.name === symbolName ? 0 : 1;
+    const bExact = b.name === symbolName ? 0 : 1;
+    if (aExact !== bExact) return aExact - bExact;
+
+    // Then sort by kind priority (concrete types first)
+    return getSymbolPriority(a.kind) - getSymbolPriority(b.kind);
+  });
+}
+
 export function isDocumentSymbolArray(
   symbols: DocumentSymbol[] | SymbolInformation[]
 ): symbols is DocumentSymbol[] {
@@ -448,54 +516,81 @@ export async function findSymbolsByName(
 
   logger.debug(`[DEBUG findSymbolsByName] Got ${symbols.length} symbols from documentSymbols\n`);
 
+  // Check if symbolName is a qualified name (e.g., "Memory.Address")
+  const qualifiedComponents = symbolName.includes('.') ? symbolName.split('.') : null;
+  // The leaf name is what we match against flat symbol lists
+  const leafName = qualifiedComponents
+    ? qualifiedComponents[qualifiedComponents.length - 1]!
+    : symbolName;
+
   if (isDocumentSymbolArray(symbols)) {
     logger.debug('[DEBUG findSymbolsByName] Processing DocumentSymbol[] (hierarchical format)\n');
-    const flatSymbols = flattenDocumentSymbols(symbols);
-    logger.debug(`[DEBUG findSymbolsByName] Flattened to ${flatSymbols.length} symbols\n`);
 
-    for (const symbol of flatSymbols) {
-      const nameMatches = symbol.name === symbolName || symbol.name.includes(symbolName);
-      const kindMatches =
-        !effectiveSymbolKind ||
-        symbolKindToString(symbol.kind) === effectiveSymbolKind.toLowerCase();
-
+    // If we have a qualified name, try hierarchical lookup first
+    if (qualifiedComponents) {
       logger.debug(
-        `[DEBUG findSymbolsByName] Checking DocumentSymbol: ${symbol.name} (${symbolKindToString(symbol.kind)}) - nameMatch: ${nameMatches}, kindMatch: ${kindMatches}\n`
+        `[DEBUG findSymbolsByName] Trying qualified name lookup: ${qualifiedComponents.join('.')}\n`
       );
-
-      if (nameMatches && kindMatches) {
+      const qualifiedMatches = findSymbolByQualifiedName(symbols, qualifiedComponents);
+      for (const symbol of qualifiedMatches) {
+        const kindMatches =
+          !effectiveSymbolKind ||
+          symbolKindToString(symbol.kind) === effectiveSymbolKind.toLowerCase();
+        if (kindMatches) {
+          matches.push({
+            name: symbol.name,
+            kind: symbol.kind,
+            position: symbol.selectionRange.start,
+            range: symbol.range,
+            detail: symbol.detail,
+          });
+        }
+      }
+      if (matches.length > 0) {
         logger.debug(
-          `[DEBUG findSymbolsByName] DocumentSymbol match: ${symbol.name} (kind=${symbol.kind}) using selectionRange ${symbol.selectionRange.start.line}:${symbol.selectionRange.start.character}\n`
+          `[DEBUG findSymbolsByName] Qualified name lookup found ${matches.length} matches\n`
         );
-        matches.push({
-          name: symbol.name,
-          kind: symbol.kind,
-          position: symbol.selectionRange.start,
-          range: symbol.range,
-          detail: symbol.detail,
-        });
+      }
+    }
+
+    // Fall back to flat search if qualified lookup found nothing
+    if (matches.length === 0) {
+      const flatSymbols = flattenDocumentSymbols(symbols);
+      logger.debug(`[DEBUG findSymbolsByName] Flattened to ${flatSymbols.length} symbols\n`);
+
+      for (const symbol of flatSymbols) {
+        const nameMatches = symbol.name === leafName || symbol.name.includes(leafName);
+        const kindMatches =
+          !effectiveSymbolKind ||
+          symbolKindToString(symbol.kind) === effectiveSymbolKind.toLowerCase();
+
+        if (nameMatches && kindMatches) {
+          logger.debug(
+            `[DEBUG findSymbolsByName] DocumentSymbol match: ${symbol.name} (kind=${symbolKindToString(symbol.kind)}) using selectionRange ${symbol.selectionRange.start.line}:${symbol.selectionRange.start.character}\n`
+          );
+          matches.push({
+            name: symbol.name,
+            kind: symbol.kind,
+            position: symbol.selectionRange.start,
+            range: symbol.range,
+            detail: symbol.detail,
+          });
+        }
       }
     }
   } else {
     logger.debug('[DEBUG findSymbolsByName] Processing SymbolInformation[] (flat format)\n');
     for (const symbol of symbols) {
-      const nameMatches = symbol.name === symbolName || symbol.name.includes(symbolName);
+      const nameMatches = symbol.name === leafName || symbol.name.includes(leafName);
       const kindMatches =
         !effectiveSymbolKind ||
         symbolKindToString(symbol.kind) === effectiveSymbolKind.toLowerCase();
 
-      logger.debug(
-        `[DEBUG findSymbolsByName] Checking SymbolInformation: ${symbol.name} (${symbolKindToString(symbol.kind)}) - nameMatch: ${nameMatches}, kindMatch: ${kindMatches}\n`
-      );
-
       if (nameMatches && kindMatches) {
         logger.debug(
-          `[DEBUG findSymbolsByName] SymbolInformation match: ${symbol.name} (kind=${symbol.kind}) at ${symbol.location.range.start.line}:${symbol.location.range.start.character} to ${symbol.location.range.end.line}:${symbol.location.range.end.character}\n`
+          `[DEBUG findSymbolsByName] SymbolInformation match: ${symbol.name} (kind=${symbolKindToString(symbol.kind)}) at ${symbol.location.range.start.line}:${symbol.location.range.start.character}\n`
         );
         const position = findSymbolPositionInFile(filePath, symbol);
-        logger.debug(
-          `[DEBUG findSymbolsByName] Found symbol position in file: ${position.line}:${position.character}\n`
-        );
         matches.push({
           name: symbol.name,
           kind: symbol.kind,
@@ -507,10 +602,15 @@ export async function findSymbolsByName(
     }
   }
 
-  logger.debug(`[DEBUG findSymbolsByName] Found ${matches.length} matching symbols\n`);
+  // Rank matches: exact names first, concrete types before type parameters
+  const rankedMatches = rankSymbolMatches(matches, leafName);
+
+  logger.debug(
+    `[DEBUG findSymbolsByName] Found ${rankedMatches.length} matching symbols (ranked)\n`
+  );
 
   let fallbackWarning: string | undefined;
-  if (effectiveSymbolKind && matches.length === 0) {
+  if (effectiveSymbolKind && rankedMatches.length === 0) {
     logger.debug(
       `[DEBUG findSymbolsByName] No matches found for kind "${effectiveSymbolKind}", trying fallback search for all kinds\n`
     );
@@ -520,7 +620,7 @@ export async function findSymbolsByName(
     if (isDocumentSymbolArray(symbols)) {
       const flatSymbols = flattenDocumentSymbols(symbols);
       for (const symbol of flatSymbols) {
-        const nameMatches = symbol.name === symbolName || symbol.name.includes(symbolName);
+        const nameMatches = symbol.name === leafName || symbol.name.includes(leafName);
         if (nameMatches) {
           fallbackMatches.push({
             name: symbol.name,
@@ -533,7 +633,7 @@ export async function findSymbolsByName(
       }
     } else {
       for (const symbol of symbols) {
-        const nameMatches = symbol.name === symbolName || symbol.name.includes(symbolName);
+        const nameMatches = symbol.name === leafName || symbol.name.includes(leafName);
         if (nameMatches) {
           const position = findSymbolPositionInFile(filePath, symbol);
           fallbackMatches.push({
@@ -548,17 +648,18 @@ export async function findSymbolsByName(
     }
 
     if (fallbackMatches.length > 0) {
-      const foundKinds = [...new Set(fallbackMatches.map((m) => symbolKindToString(m.kind)))];
-      fallbackWarning = `⚠️ No symbols found with kind "${effectiveSymbolKind}". Found ${fallbackMatches.length} symbol(s) with name "${symbolName}" of other kinds: ${foundKinds.join(', ')}.`;
-      matches.push(...fallbackMatches);
+      const ranked = rankSymbolMatches(fallbackMatches, leafName);
+      const foundKinds = [...new Set(ranked.map((m) => symbolKindToString(m.kind)))];
+      fallbackWarning = `⚠️ No symbols found with kind "${effectiveSymbolKind}". Found ${ranked.length} symbol(s) with name "${symbolName}" of other kinds: ${foundKinds.join(', ')}.`;
+      rankedMatches.push(...ranked);
       logger.debug(
-        `[DEBUG findSymbolsByName] Fallback search found ${fallbackMatches.length} additional matches\n`
+        `[DEBUG findSymbolsByName] Fallback search found ${ranked.length} additional matches\n`
       );
     }
   }
 
   const combinedWarning = [validationWarning, fallbackWarning].filter(Boolean).join(' ');
-  return { matches, warning: combinedWarning || undefined };
+  return { matches: rankedMatches, warning: combinedWarning || undefined };
 }
 
 export async function getDiagnostics(

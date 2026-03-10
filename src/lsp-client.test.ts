@@ -440,7 +440,7 @@ describe('LSPClient', () => {
       expect(result.matches).toHaveLength(3);
       expect(result.warning).toContain('No symbols found with kind "interface"');
       expect(result.warning).toContain(
-        'Found 3 symbol(s) with name "test" of other kinds: function, variable, class'
+        'Found 3 symbol(s) with name "test" of other kinds: class, function, variable'
       );
 
       getDocumentSymbolsSpy.mockRestore();

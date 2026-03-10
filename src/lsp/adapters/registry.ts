@@ -1,6 +1,7 @@
 import type { LSPServerConfig } from '../../types.js';
 import type { ServerAdapter } from '../types.js';
 import { PyrightAdapter } from './pyright.js';
+import { SourceKitLSPAdapter } from './sourcekit-lsp.js';
 import { VueLanguageServerAdapter } from './vue.js';
 
 /**
@@ -19,7 +20,7 @@ class AdapterRegistry {
     this.adapters = [
       new VueLanguageServerAdapter(),
       new PyrightAdapter(),
-      // Add more built-in adapters here as needed
+      new SourceKitLSPAdapter(),
     ];
   }
 

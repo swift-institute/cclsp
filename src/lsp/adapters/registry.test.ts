@@ -23,6 +23,16 @@ describe('AdapterRegistry', () => {
       expect(adapter?.name).toBe('pyright');
     });
 
+    it('should return SourceKitLSPAdapter for sourcekit-lsp', () => {
+      const adapter = adapterRegistry.getAdapter({
+        extensions: ['swift'],
+        command: ['sourcekit-lsp'],
+      });
+
+      expect(adapter).toBeDefined();
+      expect(adapter?.name).toBe('sourcekit-lsp');
+    });
+
     it('should return undefined for unknown server', () => {
       const adapter = adapterRegistry.getAdapter({
         extensions: ['ts'],
@@ -59,7 +69,8 @@ describe('AdapterRegistry', () => {
 
       expect(names).toContain('vue-language-server');
       expect(names).toContain('pyright');
-      expect(names.length).toBeGreaterThanOrEqual(2);
+      expect(names).toContain('sourcekit-lsp');
+      expect(names.length).toBeGreaterThanOrEqual(3);
     });
   });
 });
