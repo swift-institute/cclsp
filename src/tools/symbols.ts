@@ -1,27 +1,12 @@
 import { uriToPath } from '../utils.js';
 import { resolvePath, textResult } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
-
-/** Results shown before truncating. The suppressed count is always reported. */
-const WORKSPACE_SYMBOL_LIMIT = 50;
-
-/** `Container.Name` when the server gave us a container, else the bare name. */
-function qualifiedName(symbol: { name: string; containerName?: string }): string {
-  return symbol.containerName ? `${symbol.containerName}.${symbol.name}` : symbol.name;
-}
-
-/**
- * Rank a match against the leaf the user asked for. `workspace/symbol` matches
- * subsequences, so an unranked list buries the exact hit under thousands of
- * incidental ones — "URI" alone matched 50,200 symbols in a real workspace.
- */
-function matchRank(name: string, leaf: string): number {
-  if (name === leaf) return 0;
-  if (name.toLowerCase() === leaf.toLowerCase()) return 1;
-  if (name.startsWith(leaf)) return 2;
-  if (name.toLowerCase().includes(leaf.toLowerCase())) return 3;
-  return 4;
-}
+import {
+  WORKSPACE_SYMBOL_LIMIT,
+  filterNotes,
+  findSymbolsInWorkspace,
+  formatSymbol,
+} from './symbol-resolution.js';
 
 export const findWorkspaceSymbolsTool: ToolDefinition = {
   name: 'find_workspace_symbols',
@@ -45,78 +30,22 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
     const { query } = args as { query: string };
 
     try {
-      // `workspace/symbol` matches against the leaf name only, so a qualified
-      // query must be split: search the leaf, then constrain by the container the
-      // server reports. Sending "Byte.Protocol" verbatim always returns nothing.
-      const parts = query.split('.').filter(Boolean);
-      const leaf = parts[parts.length - 1] ?? query;
-      const container = parts.length > 1 ? parts[parts.length - 2] : undefined;
+      const filtered = await findSymbolsInWorkspace(client, query);
 
-      const symbols = await client.workspaceSymbol(leaf);
-      const total = symbols.length;
-
-      // Results on read-only dependency copies are never actionable: editing one
-      // changes a throwaway artifact that the next resolve discards. Swift units
-      // are filtered at index-build time, but C symbols reach us through Clang
-      // module units, which carry header paths inside checkouts.
-      const editable = symbols.filter((sym) => !sym.location.uri.includes('/checkouts/'));
-      const checkoutsHidden = total - editable.length;
-
-      // Mangled names ($s...) are compiler-generated — largely macro-expanded test
-      // scaffolding here. Keep them only if they are what was actually asked for.
-      const wantsGenerated = query.startsWith('$s');
-      let matches = wantsGenerated ? editable : editable.filter((sym) => !sym.name.startsWith('$s'));
-      const generatedHidden = editable.length - matches.length;
-
-      if (container) {
-        matches = matches.filter(
-          (sym) => sym.containerName === container || qualifiedName(sym).endsWith(query)
+      if (filtered.matches.length === 0) {
+        const containerNote = filtered.container
+          ? `\nThe server matched ${filtered.total} symbol(s) named like "${filtered.leaf}", but none were in "${filtered.container}".`
+          : '';
+        return textResult(
+          `No symbols found matching "${query}" [${filterNotes(filtered)}].${containerNote}`
         );
       }
 
-      // The same declaration can be indexed by more than one build; collapse them.
-      const seen = new Set<string>();
-      matches = matches.filter((sym) => {
-        const key = `${qualifiedName(sym)}|${sym.location.uri}|${sym.location.range.start.line}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-
-      matches.sort((a, b) => {
-        const byRank = matchRank(a.name, leaf) - matchRank(b.name, leaf);
-        return byRank !== 0 ? byRank : qualifiedName(a).localeCompare(qualifiedName(b));
-      });
-
-      if (matches.length === 0) {
-        const note = generatedHidden
-          ? ` (${generatedHidden} compiler-generated symbol(s) were hidden)`
-          : '';
-        const containerNote = container
-          ? `\nThe server matched ${total} symbol(s) named like "${leaf}", but none were in "${container}".`
-          : '';
-        return textResult(`No symbols found matching "${query}"${note}.${containerNote}`);
-      }
-
-      const shown = matches.slice(0, WORKSPACE_SYMBOL_LIMIT);
-      const symbolList = shown.map((sym) => {
-        const filePath = uriToPath(sym.location.uri);
-        const { start } = sym.location.range;
-        return `• ${qualifiedName(sym)} (${client.symbolKindToString(sym.kind)}) at ${filePath}:${start.line + 1}:${start.character + 1}`;
-      });
-
-      // Every number that shaped this list is stated, so a short list is never
-      // mistaken for a small result set.
-      const notes: string[] = [`${total} raw match(es) from the server`];
-      if (checkoutsHidden) notes.push(`${checkoutsHidden} on read-only checkout paths hidden`);
-      if (generatedHidden) notes.push(`${generatedHidden} compiler-generated hidden`);
-      if (container) notes.push(`filtered to container "${container}"`);
-      if (matches.length > shown.length) {
-        notes.push(`showing top ${shown.length} of ${matches.length} by relevance`);
-      }
+      const shown = filtered.matches.slice(0, WORKSPACE_SYMBOL_LIMIT);
+      const symbolList = shown.map((sym) => formatSymbol(client, sym));
 
       return textResult(
-        `Found ${matches.length} symbol(s) matching "${query}" [${notes.join('; ')}]:\n\n${symbolList.join('\n')}`
+        `Found ${filtered.matches.length} symbol(s) matching "${query}" [${filterNotes(filtered, shown.length)}]:\n\n${symbolList.join('\n')}`
       );
     } catch (error) {
       return textResult(

@@ -2,6 +2,61 @@ import { logger } from '../logger.js';
 import type { LSPClient } from '../lsp-client.js';
 import { formatLocations, resolvePath, textResult, withWarning } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
+import { filterNotes, findDeclaringFile, formatSymbol } from './symbol-resolution.js';
+
+/**
+ * Resolve a symbol that is not declared in the file the caller supplied.
+ *
+ * These tools match a name against the DOCUMENT SYMBOLS of the given file, so a
+ * file that merely uses the symbol yields nothing — a silent dead end whose
+ * message ("no symbols found") points at the index rather than at the lookup.
+ * Rather than make every caller run a workspace search by hand, do it here.
+ *
+ * Returns either a file to retry against, or the text to hand back. Ambiguity is
+ * always handed back: with several equally-good candidates in different files,
+ * picking one would report a different symbol's results under the asked-for name.
+ */
+async function resolveElsewhere(
+  client: LSPClient,
+  toolLabel: string,
+  filePath: string,
+  symbolName: string,
+  symbolKind?: string
+): Promise<{ retryPath: string; note: string } | { text: string }> {
+  // Every failure path keeps this prefix, so the message a caller sees when a
+  // symbol cannot be located stays the same regardless of whether the workspace
+  // search ran, failed, or was unavailable.
+  const notFoundHere = `No symbols found with name "${symbolName}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${filePath}.`;
+
+  let lookup: Awaited<ReturnType<typeof findDeclaringFile>>;
+  try {
+    // `workspace/symbol` is optional in LSP and cclsp serves many servers, so a
+    // server without it must degrade to the old message rather than throw.
+    lookup = await findDeclaringFile(client, symbolName, symbolKind);
+  } catch (error) {
+    return {
+      text: `${notFoundHere} A workspace search for its declaration was not possible (${error instanceof Error ? error.message : String(error)}).`,
+    };
+  }
+
+  if (lookup.outcome === 'not-found') {
+    return {
+      text: `${notFoundHere} A workspace search found no declaration anywhere either [${filterNotes(lookup.filtered)}].\nIf the index is still warming, repeating the query will return more ([NAV-002]).`,
+    };
+  }
+
+  if (lookup.outcome === 'ambiguous') {
+    const list = lookup.candidates.map((sym) => formatSymbol(client, sym)).join('\n');
+    return {
+      text: `${notFoundHere} The workspace has ${lookup.candidates.length} equally-good candidates in different files [${filterNotes(lookup.filtered)}]:\n\n${list}\n\nRe-run ${toolLabel} with file_path set to the declaration you mean — reporting one of these as if it were the others would attribute the wrong symbol's results.`,
+    };
+  }
+
+  return {
+    retryPath: lookup.path,
+    note: `"${symbolName}" is not declared in ${filePath}; resolved to ${formatSymbol(client, lookup.symbol).replace(/^• /, '')} and reporting from there.`,
+  };
+}
 
 export const findDefinitionTool: ToolDefinition = {
   name: 'find_definition',
@@ -31,9 +86,26 @@ export const findDefinitionTool: ToolDefinition = {
       symbol_name: string;
       symbol_kind?: string;
     };
-    const absolutePath = resolvePath(file_path);
+    let searchPath = resolvePath(file_path);
+    let redirect = '';
 
-    const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
+    let result = await client.findSymbolsByName(searchPath, symbol_name, symbol_kind);
+
+    // Not declared here — find where it IS declared rather than dead-ending.
+    if (result.matches.length === 0) {
+      const resolved = await resolveElsewhere(
+        client,
+        'find_definition',
+        file_path,
+        symbol_name,
+        symbol_kind
+      );
+      if ('text' in resolved) return textResult(resolved.text);
+      searchPath = resolved.retryPath;
+      redirect = `${resolved.note}\n\n`;
+      result = await client.findSymbolsByName(searchPath, symbol_name, symbol_kind);
+    }
+
     const { matches: symbolMatches, warning } = result;
 
     logger.debug(
@@ -42,7 +114,7 @@ export const findDefinitionTool: ToolDefinition = {
 
     if (symbolMatches.length === 0) {
       return textResult(
-        `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}. Please verify the symbol name and ensure the language server is properly configured.`
+        `${redirect}No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${searchPath}. Please verify the symbol name and ensure the language server is properly configured.`
       );
     }
 
@@ -52,13 +124,13 @@ export const findDefinitionTool: ToolDefinition = {
         `[find_definition] Processing match: ${match.name} (${client.symbolKindToString(match.kind)}) at ${match.position.line}:${match.position.character}\n`
       );
       try {
-        const locations = await client.findDefinition(absolutePath, match.position);
+        const locations = await client.findDefinition(searchPath, match.position);
         logger.debug(`[find_definition] findDefinition returned ${locations.length} locations\n`);
 
         if (locations.length > 0) {
           const locationResults = formatLocations(locations);
           results.push(
-            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${file_path}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
+            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${searchPath}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
           );
         } else {
           logger.debug(
@@ -74,12 +146,12 @@ export const findDefinitionTool: ToolDefinition = {
       return textResult(
         withWarning(
           warning,
-          `Found ${symbolMatches.length} symbol(s) but no definitions could be retrieved. Please ensure the language server is properly configured.`
+          `${redirect}Found ${symbolMatches.length} symbol(s) but no definitions could be retrieved. Please ensure the language server is properly configured.`
         )
       );
     }
 
-    return textResult(withWarning(warning, results.join('\n\n')));
+    return textResult(withWarning(warning, redirect + results.join('\n\n')));
   },
 };
 
@@ -122,16 +194,33 @@ export const findReferencesTool: ToolDefinition = {
       symbol_kind?: string;
       include_declaration?: boolean;
     };
-    const absolutePath = resolvePath(file_path);
+    let searchPath = resolvePath(file_path);
+    let redirect = '';
 
-    const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
+    let result = await client.findSymbolsByName(searchPath, symbol_name, symbol_kind);
+
+    // Not declared here — find where it IS declared rather than dead-ending.
+    if (result.matches.length === 0) {
+      const resolved = await resolveElsewhere(
+        client,
+        'find_references',
+        file_path,
+        symbol_name,
+        symbol_kind
+      );
+      if ('text' in resolved) return textResult(resolved.text);
+      searchPath = resolved.retryPath;
+      redirect = `${resolved.note}\n\n`;
+      result = await client.findSymbolsByName(searchPath, symbol_name, symbol_kind);
+    }
+
     const { matches: symbolMatches, warning } = result;
 
     if (symbolMatches.length === 0) {
       return textResult(
         withWarning(
           warning,
-          `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}. Please verify the symbol name and ensure the language server is properly configured.`
+          `${redirect}No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${searchPath}. Please verify the symbol name and ensure the language server is properly configured.`
         )
       );
     }
@@ -140,7 +229,7 @@ export const findReferencesTool: ToolDefinition = {
     for (const match of symbolMatches) {
       try {
         const locations = await client.findReferences(
-          absolutePath,
+          searchPath,
           match.position,
           include_declaration
         );
@@ -148,7 +237,7 @@ export const findReferencesTool: ToolDefinition = {
         if (locations.length > 0) {
           const locationResults = formatLocations(locations);
           results.push(
-            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${file_path}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
+            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${searchPath}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
           );
         }
       } catch (_error) {
@@ -160,12 +249,12 @@ export const findReferencesTool: ToolDefinition = {
       return textResult(
         withWarning(
           warning,
-          `Found ${symbolMatches.length} symbol(s) but no references could be retrieved. Please ensure the language server is properly configured.`
+          `${redirect}Found ${symbolMatches.length} symbol(s) but no references could be retrieved. The index may still be warming ([NAV-002]) — repeat the query before concluding it is empty.`
         )
       );
     }
 
-    return textResult(withWarning(warning, results.join('\n\n')));
+    return textResult(withWarning(warning, redirect + results.join('\n\n')));
   },
 };
 
