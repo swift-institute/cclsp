@@ -25,7 +25,11 @@ export class JsonRpcTransport {
     number,
     { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
   > = new Map();
-  private buffer = '';
+  // Bytes, not a string. Content-Length is a BYTE count, so the receive buffer
+  // has to be sliced in bytes; decoding to a string first makes every non-ASCII
+  // character shorten the slice, which consumes part of the next message's
+  // header and desynchronises the stream permanently.
+  private buffer: Buffer = Buffer.alloc(0);
 
   constructor(
     private readonly process: ChildProcess,
@@ -40,11 +44,16 @@ export class JsonRpcTransport {
    */
   private setupStdoutHandler(): void {
     this.process.stdout?.on('data', (data: Buffer) => {
-      this.buffer += data.toString();
+      // Concatenating bytes also keeps multi-byte characters intact across chunk
+      // boundaries; decoding each chunk on arrival can split one and corrupt it.
+      this.buffer = Buffer.concat([this.buffer, data]);
 
-      while (this.buffer.includes('\r\n\r\n')) {
+      while (true) {
         const headerEndIndex = this.buffer.indexOf('\r\n\r\n');
-        const headerPart = this.buffer.substring(0, headerEndIndex);
+        if (headerEndIndex === -1) break;
+
+        // Headers are ASCII by specification; only the payload may be UTF-8.
+        const headerPart = this.buffer.subarray(0, headerEndIndex).toString('ascii');
         const contentLengthMatch = headerPart.match(/Content-Length: (\d+)/);
 
         if (contentLengthMatch?.[1]) {
@@ -52,11 +61,10 @@ export class JsonRpcTransport {
           const messageStart = headerEndIndex + 4;
 
           if (this.buffer.length >= messageStart + contentLength) {
-            const messageContent = this.buffer.substring(
-              messageStart,
-              messageStart + contentLength
-            );
-            this.buffer = this.buffer.substring(messageStart + contentLength);
+            const messageContent = this.buffer
+              .subarray(messageStart, messageStart + contentLength)
+              .toString('utf8');
+            this.buffer = this.buffer.subarray(messageStart + contentLength);
 
             try {
               const message: LSPMessage = JSON.parse(messageContent);
@@ -68,7 +76,7 @@ export class JsonRpcTransport {
             break;
           }
         } else {
-          this.buffer = this.buffer.substring(headerEndIndex + 4);
+          this.buffer = this.buffer.subarray(headerEndIndex + 4);
         }
       }
     });
